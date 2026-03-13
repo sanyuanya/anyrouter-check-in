@@ -129,26 +129,112 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				return None
 
 
-def get_user_info(client, headers, user_info_url: str):
-	"""获取用户信息"""
+def get_user_info(client, headers, user_info_url: str, account_name: str = 'Account'):
+	"""获取用户信息
+
+	Returns:
+		dict: 包含以下字段:
+			- success: bool, 是否成功
+			- quota: float, 余额（成功时）
+			- used_quota: float, 已用额度（成功时）
+			- display: str, 显示信息（成功时）
+			- error: str, 错误信息（失败时）
+			- error_type: str, 错误类型（失败时）:
+				- 'http_error': HTTP 状态码非 2xx
+				- 'empty_response': 响应体为空
+				- 'html_response': 返回 HTML（可能是登录页/验证页）
+				- 'json_parse_error': JSON 解析失败
+				- 'invalid_structure': JSON 结构不符合预期
+				- 'api_error': API 返回 success=false
+	"""
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
-		if response.status_code == 200:
-			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+		content_type = response.headers.get('content-type', '')
+		response_text = response.text
+		preview_len = 200
+		response_preview = response_text[:preview_len] if response_text else '(empty)'
+
+		print(f'[DEBUG] {account_name}: user_info response - HTTP {response.status_code}, Content-Type: {content_type}')
+		print(f'[DEBUG] {account_name}: response preview: {response_preview}')
+
+		if response.status_code < 200 or response.status_code >= 300:
+			error_type = 'http_error'
+			if response.status_code == 401 or response.status_code == 403:
+				error_type = 'auth_error'
+				error_msg = f'Authentication failed (HTTP {response.status_code}) - cookies may be expired'
+			elif response.status_code >= 500:
+				error_msg = f'Server error (HTTP {response.status_code})'
+			else:
+				error_msg = f'HTTP request failed with status {response.status_code}'
+			return {'success': False, 'error': error_msg, 'error_type': error_type}
+
+		if not response_text or not response_text.strip():
+			return {'success': False, 'error': 'Empty response from server', 'error_type': 'empty_response'}
+
+		if 'text/html' in content_type or response_text.strip().startswith('<'):
+			if 'login' in response_text.lower() or 'sign in' in response_text.lower():
 				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					'success': False,
+					'error': 'Received login page - cookies may be expired',
+					'error_type': 'html_response',
 				}
-		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
+			elif 'challenge' in response_text.lower() or 'verify' in response_text.lower():
+				return {
+					'success': False,
+					'error': 'Received verification/challenge page - may need manual intervention',
+					'error_type': 'html_response',
+				}
+			else:
+				return {
+					'success': False,
+					'error': 'Received HTML response instead of JSON - unexpected server behavior',
+					'error_type': 'html_response',
+				}
+
+		try:
+			data = response.json()
+		except json.JSONDecodeError as e:
+			return {
+				'success': False,
+				'error': f'JSON parse error: {str(e)[:50]}',
+				'error_type': 'json_parse_error',
+			}
+
+		if not isinstance(data, dict):
+			return {
+				'success': False,
+				'error': f'Unexpected JSON type: {type(data).__name__}, expected object',
+				'error_type': 'invalid_structure',
+			}
+
+		if not data.get('success'):
+			error_msg = data.get('message', data.get('msg', 'API returned success=false'))
+			return {'success': False, 'error': error_msg, 'error_type': 'api_error'}
+
+		user_data = data.get('data')
+		if not user_data or not isinstance(user_data, dict):
+			return {
+				'success': False,
+				'error': 'Missing or invalid "data" field in response',
+				'error_type': 'invalid_structure',
+			}
+
+		quota = round(user_data.get('quota', 0) / 500000, 2)
+		used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+		return {
+			'success': True,
+			'quota': quota,
+			'used_quota': used_quota,
+			'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+		}
+
+	except httpx.TimeoutException:
+		return {'success': False, 'error': 'Request timeout', 'error_type': 'network_error'}
+	except httpx.NetworkError as e:
+		return {'success': False, 'error': f'Network error: {str(e)[:50]}', 'error_type': 'network_error'}
 	except Exception as e:
-		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+		return {'success': False, 'error': f'Unexpected error: {str(e)[:50]}', 'error_type': 'unknown'}
 
 
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
@@ -297,22 +383,29 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		}
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-		user_info_before = get_user_info(client, headers, user_info_url)
+		user_info_before = get_user_info(client, headers, user_info_url, account_name)
 		if user_info_before and user_info_before.get('success'):
 			print(user_info_before['display'])
 		elif user_info_before:
-			print(user_info_before.get('error', 'Unknown error'))
+			error_type = user_info_before.get('error_type', 'unknown')
+			error_msg = user_info_before.get('error', 'Unknown error')
+			print(f'[FAILED] {account_name}: {error_msg} (type: {error_type})')
 
 		if provider_config.needs_manual_check_in():
 			success = execute_check_in(client, account_name, provider_config, headers)
 			# 签到后再次获取用户信息，用于计算签到收益
-			user_info_after = get_user_info(client, headers, user_info_url)
+			user_info_after = get_user_info(client, headers, user_info_url, account_name)
 			return success, user_info_before, user_info_after
 		else:
-			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-			# 自动签到的情况，再次获取用户信息
-			user_info_after = get_user_info(client, headers, user_info_url)
-			return True, user_info_before, user_info_after
+			# 自动签到模式（如 agentrouter）：user_info 请求即触发签到
+			# 只有当 user_info_before 成功时，才能判定签到成功
+			if user_info_before and user_info_before.get('success'):
+				print(f'[SUCCESS] {account_name}: Check-in completed automatically (triggered by user info request)')
+				user_info_after = get_user_info(client, headers, user_info_url, account_name)
+				return True, user_info_before, user_info_after
+			else:
+				print(f'[FAILED] {account_name}: Auto check-in failed - user info request did not succeed')
+				return False, user_info_before, None
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
