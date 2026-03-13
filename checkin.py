@@ -129,15 +129,76 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				return None
 
 
-def get_user_info(client, headers, user_info_url: str):
+def classify_user_info_error(response, exception=None):
+	"""分类 user info 请求错误类型"""
+	if exception is not None:
+		if isinstance(exception, json.JSONDecodeError):
+			return 'INVALID_JSON', 'Response is not valid JSON'
+		if 'Connect' in str(exception) or 'Connection' in str(exception):
+			return 'CONNECTION_ERROR', f'Connection failed: {str(exception)[:30]}'
+		if 'timeout' in str(exception).lower():
+			return 'TIMEOUT', 'Request timeout'
+		return 'EXCEPTION', f'Exception: {str(exception)[:40]}'
+
+	status_code = response.status_code
+	response_text = response.text
+	content_type = response.headers.get('Content-Type', '')
+
+	if 400 <= status_code < 500:
+		if status_code == 401 or status_code == 403:
+			return 'COOKIES_INVALID', f'Cookies may be expired (HTTP {status_code})'
+		return 'HTTP_CLIENT_ERROR', f'HTTP {status_code}'
+
+	if status_code >= 500:
+		return 'HTTP_SERVER_ERROR', f'HTTP {status_code}'
+
+	if not response_text or not response_text.strip():
+		return 'EMPTY_RESPONSE', 'Empty response body'
+
+	if 'text/html' in content_type.lower():
+		lower_text = response_text.lower()
+		if '<form' in lower_text and ('login' in lower_text or 'password' in lower_text):
+			return 'LOGIN_PAGE', 'Redirected to login page (cookies expired)'
+		if 'challenge' in lower_text or 'verification' in lower_text or 'captcha' in lower_text:
+			return 'CHALLENGE_PAGE', 'Challenge/verification page detected'
+		if '<!doctype html' in lower_text or '<html' in lower_text:
+			return 'HTML_RESPONSE', 'Unexpected HTML response'
+
+	if 'application/json' not in content_type.lower():
+		return 'INVALID_CONTENT_TYPE', f'Expected JSON but got {content_type}'
+
+	return 'UNKNOWN_ERROR', f'HTTP {status_code}'
+
+
+def get_user_info(client, headers, user_info_url: str, account_name: str = None):
 	"""获取用户信息"""
+	prefix = f'{account_name}: ' if account_name else ''
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
-		if response.status_code == 200:
+		print(f'[RESPONSE] {prefix}User info status code: {response.status_code}')
+		content_type = response.headers.get('Content-Type', 'N/A')
+		print(f'[RESPONSE] {prefix}Content-Type: {content_type}')
+		response_preview = response.text[:200] if response.text else '(empty)'
+		print(f'[RESPONSE] {prefix}Response preview: {response_preview}')
+
+		if not (200 <= response.status_code < 300):
+			error_code, error_msg = classify_user_info_error(response)
+			return {'success': False, 'error': f'Failed to get user info: {error_msg}', 'error_code': error_code}
+
+		if not response.text or not response.text.strip():
+			error_code, error_msg = classify_user_info_error(response)
+			return {'success': False, 'error': f'Failed to get user info: {error_msg}', 'error_code': error_code}
+
+		try:
 			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
+		except json.JSONDecodeError as e:
+			error_code, error_msg = classify_user_info_error(response, e)
+			return {'success': False, 'error': f'JSON parse failed: {error_msg}', 'error_code': error_code}
+
+		if data.get('success'):
+			user_data = data.get('data', {})
+			if isinstance(user_data, dict) and 'quota' in user_data and 'used_quota' in user_data:
 				quota = round(user_data.get('quota', 0) / 500000, 2)
 				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
 				return {
@@ -146,9 +207,15 @@ def get_user_info(client, headers, user_info_url: str):
 					'used_quota': used_quota,
 					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
 				}
-		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
+			else:
+				return {'success': False, 'error': 'Invalid JSON structure: missing required fields', 'error_code': 'INVALID_JSON_STRUCTURE'}
+		else:
+			api_error = data.get('msg', data.get('message', 'API returned success=false'))
+			return {'success': False, 'error': f'API error: {api_error}', 'error_code': 'API_ERROR'}
+
 	except Exception as e:
-		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+		error_code, error_msg = classify_user_info_error(None, e)
+		return {'success': False, 'error': f'Failed to get user info: {error_msg}', 'error_code': error_code}
 
 
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
@@ -264,18 +331,18 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None
+		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
 	user_cookies = parse_cookies(account.cookies)
 	if not user_cookies:
 		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
+		return False, None, None
 
 	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 	if not all_cookies:
-		return False, None
+		return False, None, None
 
 	client = httpx.Client(http2=True, timeout=30.0)
 
@@ -297,22 +364,26 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		}
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-		user_info_before = get_user_info(client, headers, user_info_url)
+		user_info_before = get_user_info(client, headers, user_info_url, account_name)
 		if user_info_before and user_info_before.get('success'):
 			print(user_info_before['display'])
 		elif user_info_before:
-			print(user_info_before.get('error', 'Unknown error'))
+			print(f'[FAILED] {account_name}: {user_info_before.get("error", "Unknown error")}')
 
 		if provider_config.needs_manual_check_in():
 			success = execute_check_in(client, account_name, provider_config, headers)
 			# 签到后再次获取用户信息，用于计算签到收益
-			user_info_after = get_user_info(client, headers, user_info_url)
+			user_info_after = get_user_info(client, headers, user_info_url, account_name)
 			return success, user_info_before, user_info_after
 		else:
-			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-			# 自动签到的情况，再次获取用户信息
-			user_info_after = get_user_info(client, headers, user_info_url)
-			return True, user_info_before, user_info_after
+			if user_info_before and user_info_before.get('success'):
+				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
+				# 自动签到的情况，再次获取用户信息
+				user_info_after = get_user_info(client, headers, user_info_url, account_name)
+				return True, user_info_before, user_info_after
+			else:
+				print(f'[FAILED] {account_name}: Automatic check-in failed - user info request unsuccessful')
+				return False, user_info_before, None
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
