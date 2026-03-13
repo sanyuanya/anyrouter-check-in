@@ -129,26 +129,143 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				return None
 
 
-def get_user_info(client, headers, user_info_url: str):
-	"""获取用户信息"""
+class UserInfoError(Exception):
+	"""用户信息获取错误基类"""
+
+	def __init__(self, error_type: str, message: str, status_code: int | None = None, content_type: str | None = None, response_preview: str | None = None):
+		self.error_type = error_type
+		self.message = message
+		self.status_code = status_code
+		self.content_type = content_type
+		self.response_preview = response_preview
+		super().__init__(message)
+
+
+class CookieExpiredError(UserInfoError):
+	"""Cookie 已失效"""
+	pass
+
+
+class ChallengePageError(UserInfoError):
+	"""返回 Challenge/Verification 页面"""
+	pass
+
+
+class LoginPageError(UserInfoError):
+	"""返回登录页面"""
+	pass
+
+
+class EmptyResponseError(UserInfoError):
+	"""返回空响应"""
+	pass
+
+
+class NonJsonResponseError(UserInfoError):
+	"""返回非 JSON 响应"""
+	pass
+
+
+class HttpError(UserInfoError):
+	"""HTTP 错误"""
+	pass
+
+
+class InvalidJsonStructureError(UserInfoError):
+	"""JSON 结构不符合预期"""
+	pass
+
+
+def get_user_info(client, headers, user_info_url: str, account_name: str = '') -> dict:
+	"""获取用户信息
+
+	Args:
+		client: HTTP 客户端
+		headers: 请求头
+		user_info_url: 用户信息接口 URL
+		account_name: 账号名称（用于日志）
+
+	Returns:
+		包含 success 字段的字典，失败时包含 error 和 error_type 字段
+
+	Raises:
+		UserInfoError: 各种用户 info 获取失败的错误
+	"""
+	prefix = f'[{account_name}] ' if account_name else ''
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
-		if response.status_code == 200:
+		# 获取响应信息用于日志和调试
+		status_code = response.status_code
+		content_type = response.headers.get('Content-Type', 'unknown')
+		response_text = response.text
+		response_preview = response_text[:200] if response_text else '<empty>'
+
+		print(f'[NETWORK] {prefix}User info response: status={status_code}, Content-Type={content_type}')
+		print(f'[DEBUG] {prefix}Response preview: {response_preview}')
+
+		# 检查 HTTP 状态码
+		if status_code >= 500:
+			raise HttpError('http_server_error', f'Server error: HTTP {status_code}', status_code, content_type, response_preview)
+		if status_code >= 400:
+			# 401/403 通常表示 cookies 失效
+			if status_code in (401, 403):
+				raise CookieExpiredError('cookie_expired', f'Authentication failed: HTTP {status_code}', status_code, content_type, response_preview)
+			raise HttpError('http_client_error', f'Client error: HTTP {status_code}', status_code, content_type, response_preview)
+
+		# 检查是否返回空响应
+		if not response_text or not response_text.strip():
+			raise EmptyResponseError('empty_response', 'Empty response body', status_code, content_type, response_preview)
+
+		# 检查 Content-Type，如果不是 JSON 类型，可能是 HTML 页面
+		if 'application/json' not in content_type.lower():
+			# 检查是否是 HTML 页面
+			if '<html' in response_text.lower() or '<!doctype' in response_text.lower():
+				# 检查是否是登录页
+				login_indicators = ['login', 'signin', '登录', 'sign in', 'password', '密码']
+				if any(indicator in response_text.lower() for indicator in login_indicators):
+					raise LoginPageError('login_page', 'Redirected to login page', status_code, content_type, response_preview)
+				# 检查是否是 challenge/verification 页面
+				challenge_indicators = ['challenge', 'captcha', 'verify', 'verification', 'waf', '防火墙', '验证']
+				if any(indicator in response_text.lower() for indicator in challenge_indicators):
+					raise ChallengePageError('challenge_page', 'Challenge/verification page detected', status_code, content_type, response_preview)
+				raise NonJsonResponseError('html_response', 'Received HTML instead of JSON', status_code, content_type, response_preview)
+			raise NonJsonResponseError('non_json_response', f'Expected JSON but got {content_type}', status_code, content_type, response_preview)
+
+		# 尝试解析 JSON
+		try:
 			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
-				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
-				}
-		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
+		except json.JSONDecodeError as e:
+			raise NonJsonResponseError('json_decode_error', f'JSON decode error: {str(e)}', status_code, content_type, response_preview)
+
+		# 检查 JSON 结构是否符合预期
+		if not isinstance(data, dict):
+			raise InvalidJsonStructureError('invalid_json_structure', f'Expected dict but got {type(data).__name__}', status_code, content_type, str(data)[:200])
+
+		# 检查 API 返回的成功状态
+		if not data.get('success'):
+			error_msg = data.get('message', data.get('msg', 'Unknown API error'))
+			raise InvalidJsonStructureError('api_error', f'API returned error: {error_msg}', status_code, content_type, str(data)[:200])
+
+		# 提取用户数据
+		user_data = data.get('data', {})
+		if not isinstance(user_data, dict):
+			raise InvalidJsonStructureError('invalid_user_data', f'Expected user data dict but got {type(user_data).__name__}', status_code, content_type, str(data)[:200])
+
+		quota = round(user_data.get('quota', 0) / 500000, 2)
+		used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+
+		return {
+			'success': True,
+			'quota': quota,
+			'used_quota': used_quota,
+			'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+		}
+
+	except UserInfoError:
+		raise
 	except Exception as e:
-		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+		raise UserInfoError('unknown_error', f'Unexpected error: {str(e)}')
 
 
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
@@ -264,18 +381,18 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None
+		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
 	user_cookies = parse_cookies(account.cookies)
 	if not user_cookies:
 		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
+		return False, None, None
 
 	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 	if not all_cookies:
-		return False, None
+		return False, None, None
 
 	client = httpx.Client(http2=True, timeout=30.0)
 
@@ -297,25 +414,57 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		}
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-		user_info_before = get_user_info(client, headers, user_info_url)
-		if user_info_before and user_info_before.get('success'):
-			print(user_info_before['display'])
-		elif user_info_before:
-			print(user_info_before.get('error', 'Unknown error'))
+
+		# 获取签到前的用户信息
+		try:
+			user_info_before = get_user_info(client, headers, user_info_url, account_name)
+			print(f'[SUCCESS] {account_name}: {user_info_before["display"]}')
+		except UserInfoError as e:
+			# 根据错误类型打印详细的错误信息
+			error_messages = {
+				'cookie_expired': f'[FAILED] {account_name}: Cookies expired or invalid - {e.message}',
+				'login_page': f'[FAILED] {account_name}: Redirected to login page - {e.message}',
+				'challenge_page': f'[FAILED] {account_name}: Challenge/verification required - {e.message}',
+				'empty_response': f'[FAILED] {account_name}: Empty response from server - {e.message}',
+				'html_response': f'[FAILED] {account_name}: Received HTML instead of JSON - {e.message}',
+				'non_json_response': f'[FAILED] {account_name}: Non-JSON response - {e.message}',
+				'json_decode_error': f'[FAILED] {account_name}: Failed to parse JSON response - {e.message}',
+				'http_server_error': f'[FAILED] {account_name}: Server error - {e.message}',
+				'http_client_error': f'[FAILED] {account_name}: Client error - {e.message}',
+				'api_error': f'[FAILED] {account_name}: API returned error - {e.message}',
+				'invalid_json_structure': f'[FAILED] {account_name}: Invalid response structure - {e.message}',
+				'invalid_user_data': f'[FAILED] {account_name}: Invalid user data format - {e.message}',
+				'unknown_error': f'[FAILED] {account_name}: Unexpected error - {e.message}',
+			}
+			print(error_messages.get(e.error_type, f'[FAILED] {account_name}: {e.message}'))
+			return False, None, None
+		except Exception as e:
+			print(f'[FAILED] {account_name}: Unexpected error getting user info - {str(e)[:100]}')
+			return False, None, None
 
 		if provider_config.needs_manual_check_in():
 			success = execute_check_in(client, account_name, provider_config, headers)
 			# 签到后再次获取用户信息，用于计算签到收益
-			user_info_after = get_user_info(client, headers, user_info_url)
+			try:
+				user_info_after = get_user_info(client, headers, user_info_url, account_name)
+			except UserInfoError as e:
+				print(f'[WARNING] {account_name}: Failed to get user info after check-in - {e.message}')
+				user_info_after = None
 			return success, user_info_before, user_info_after
 		else:
-			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-			# 自动签到的情况，再次获取用户信息
-			user_info_after = get_user_info(client, headers, user_info_url)
-			return True, user_info_before, user_info_after
+			# 自动签到的情况：只有在成功获取用户信息后才算签到成功
+			# 再次获取用户信息以确认签到状态
+			try:
+				user_info_after = get_user_info(client, headers, user_info_url, account_name)
+				# 两次都成功获取用户信息，才判定为签到成功
+				print(f'[SUCCESS] {account_name}: Check-in completed automatically (triggered by user info request)')
+				return True, user_info_before, user_info_after
+			except UserInfoError as e:
+				print(f'[FAILED] {account_name}: Auto check-in verification failed - {e.message}')
+				return False, user_info_before, None
 
 	except Exception as e:
-		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
+		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:100]}')
 		return False, None, None
 	finally:
 		client.close()
